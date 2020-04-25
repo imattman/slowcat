@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -11,26 +12,33 @@ import (
 	"time"
 )
 
-const defaultDelay = 10 * time.Millisecond
-
 func main() {
-	var (
-		minDelay time.Duration
-		maxDelay time.Duration
-	)
-	flag.DurationVar(&minDelay, "d", defaultDelay, "Uniform delay between item output")
-	flag.DurationVar(&minDelay, "min", defaultDelay, "Minimum variable delaybetween item output")
-	flag.DurationVar(&maxDelay, "max", 0, "Maximum variable delay between item output (defaults to 'min')")
+	splitBytes := flag.Bool("b", true, "No partitioning; read input as bytes")
+	splitRunes := flag.Bool("c", false, "Partition input at UTF-8 character boundaries")
+	splitWords := flag.Bool("w", false, "Partition input at word boundaries")
+	splitLines := flag.Bool("l", false, "Partition input at line boundaries")
+	minDelay := flag.Duration("min", 10*time.Millisecond, "Minimum delay between items output")
+	maxDelay := flag.Duration("max", 100*time.Millisecond, "Maximum delay between items output")
+	uniform := flag.Duration("d", 0*time.Millisecond, "Sets min and max to same value for uniform delay between items")
 	flag.Parse()
 
-	if maxDelay < minDelay {
-		maxDelay = minDelay
+	if *uniform > 0 {
+		*minDelay = *uniform
+		*maxDelay = *uniform
 	}
 
-	delayFunc := newDelayFunc(minDelay, maxDelay)
+	if *maxDelay < *minDelay {
+		*maxDelay = *minDelay
+	}
+
+	ctx := context.Background()
+	ticker := delayedTicker(ctx, *minDelay, *maxDelay)
 
 	if len(flag.Args()) < 1 {
-		copySlow(os.Stdout, os.Stdin, delayFunc)
+		scan := bufio.NewScanner(os.Stdin)
+		split, sep := splitterFunc(*splitLines, *splitWords, *splitRunes, *splitBytes)
+		scan.Split(split)
+		copySlow(ctx, os.Stdout, scan, sep, ticker)
 		return
 	}
 
@@ -40,7 +48,11 @@ func main() {
 			fatal("Error opening %s : %v", fname, err)
 		}
 
-		err = copySlow(os.Stdout, f, delayFunc)
+		scan := bufio.NewScanner(f)
+		split, sep := splitterFunc(*splitLines, *splitWords, *splitRunes, *splitBytes)
+		scan.Split(split)
+
+		err = copySlow(ctx, os.Stdout, scan, sep, ticker)
 		f.Close()
 		if err != nil {
 			fatal("Error writing %v", err)
@@ -48,12 +60,12 @@ func main() {
 	}
 }
 
-func copySlow(w io.Writer, r io.Reader, delayFunc func()) error {
-	buf := bufio.NewReader(r)
-	bs := make([]byte, 1)
+func copySlow(ctx context.Context, w io.Writer, scan *bufio.Scanner, sep []byte, ticker <-chan struct{}) error {
+	firstItem := true
 
-	for {
-		b, err := buf.ReadByte()
+	for scan.Scan() {
+		bs := scan.Bytes()
+		err := scan.Err()
 		if err != nil {
 			if err == io.EOF {
 				break
@@ -61,15 +73,46 @@ func copySlow(w io.Writer, r io.Reader, delayFunc func()) error {
 			return err
 		}
 
-		delayFunc()
-		bs[0] = b
+		// tick precedes write
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker: // keep going
+		}
+
 		_, err = w.Write(bs)
+		firstItem = false
 		if err != nil {
 			return err
+		}
+
+		if !firstItem {
+			_, err = w.Write(sep)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
 	return nil
+}
+
+func delayedTicker(ctx context.Context, min, max time.Duration) <-chan struct{} {
+	delay := newDelayFunc(min, max)
+	tickCh := make(chan struct{})
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case tickCh <- struct{}{}:
+				delay()
+			}
+		}
+	}()
+
+	return tickCh
 }
 
 func newDelayFunc(min time.Duration, max time.Duration) func() {
@@ -84,6 +127,19 @@ func newDelayFunc(min time.Duration, max time.Duration) func() {
 
 	return func() {
 		time.Sleep(time.Duration(rand.Intn(shifted) + int(min)))
+	}
+}
+
+func splitterFunc(splitLines, splitWords, splitRunes, splitBytes bool) (split bufio.SplitFunc, sep []byte) {
+	switch {
+	case splitLines:
+		return bufio.ScanLines, []byte("\n")
+	case splitWords:
+		return bufio.ScanWords, []byte(" ")
+	case splitRunes:
+		return bufio.ScanRunes, nil
+	default:
+		return bufio.ScanBytes, nil
 	}
 }
 
